@@ -32,12 +32,13 @@ import Control.Monad.IO.Class ( MonadIO(..) )
 
 import Data.Bifunctor
 import qualified Data.List as List
+import qualified Data.Map.Strict as Map
 import Data.Text.Lazy (Text)
 
 import Agda.Syntax.Common
 import Agda.Syntax.Position
 import Agda.Syntax.Parser.Monad
-  ( ParseError(..), ParseWarning(..), ParseResult(..), ParseFlags, LexState
+  ( ParseError(..), ParseWarning(..), ParseResult(..), ParseFlags, LexState, Column
   , ParseState (parseWarnings, parseAttributes), defaultParseFlags, parseKeepComments
   )
 import qualified Agda.Syntax.Parser.Monad as M
@@ -111,7 +112,7 @@ data Parser a = Parser
   }
 
 type LiterateParser a =
-  Parser a -> SrcFile -> [Layer] -> PM (a, Attributes)
+  Parser a -> SrcFile -> Map.Map Column Column -> [Layer] -> PM (a, Attributes)
 
 -- | Initial state for lexing.
 
@@ -131,22 +132,23 @@ parse p = wrapM . return . M.parse (parseFlags p) normalLexState (parser p)
 -- | Parse with top-level layout.
 
 parseFileFromString
-  :: SrcFile   -- ^ Name of source file.
+  :: Map.Map Column Column  -- ^ Per-line layout-column bias, see 'columnBias'.
+  -> SrcFile   -- ^ Name of source file.
   -> Parser a  -- ^ Parser to use.
   -> String    -- ^ Contents of source file.
   -> PM (a, Attributes)
-parseFileFromString src p = wrapM . return . M.parseFromSrc (parseFlags p) layoutLexState (parser p) src
+parseFileFromString bias src p = wrapM . return . M.parseFromSrc bias (parseFlags p) layoutLexState (parser p) src
 
 -- | Parse with top-level layout.
 
 parseLiterateWithoutComments :: LiterateParser a
-parseLiterateWithoutComments p f layers = parseFileFromString f p $ illiterate layers
+parseLiterateWithoutComments p f bias layers = parseFileFromString bias f p $ illiterate layers
 
 -- | Parse with top-level layout.
 
 parseLiterateWithComments :: LiterateParser [Token]
-parseLiterateWithComments p f layers = do
-  (code, coh) <- parseLiterateWithoutComments p f layers
+parseLiterateWithComments p f bias layers = do
+  (code, coh) <- parseLiterateWithoutComments p f bias layers
   let literate = filter (not . isCodeLayer) layers
   let (terms, overlaps) = interleaveRanges (map Left code) (map Right literate)
 
@@ -161,7 +163,10 @@ parseLiterateWithComments p f layers = do
 
 
 parseLiterateFile
-  :: Processor
+  :: FileType
+     -- ^ Only 'ScrblFileType' gets a non-trivial 'columnBias' — see its
+     -- Haddock for why other literate formats must not opt in.
+  -> Processor
   -> Parser a
   -> RangeFile
      -- ^ The file.
@@ -169,7 +174,12 @@ parseLiterateFile
      -- ^ The file contents. Note that the file is /not/ read from
      -- disk.
   -> PM (a, Attributes)
-parseLiterateFile po p path = parseLiterate p p (pure path) . po (startPos' ())
+parseLiterateFile ft po p path input =
+  parseLiterate p p (pure path) bias layers
+  where
+  layers = po (startPos' ()) input
+  bias | ft == ScrblFileType = columnBias layers
+       | otherwise           = Map.empty
 
 parsePosString :: Parser a -> Position -> String -> PM (a, Attributes)
 parsePosString p pos = wrapM . return . M.parsePosString pos (parseFlags p) normalLexState (parser p)
@@ -202,7 +212,7 @@ parseFile ::
   -> PM ((a, Attributes), FileType)
 parseFile onlyAgdaBlocks p file input =
   if ".agda" `List.isSuffixOf` path then
-    (, AgdaFileType) <$> parseFileFromString (Strict.Just file) p input
+    (, AgdaFileType) <$> parseFileFromString Map.empty (Strict.Just file) p input
   else
     go (literateProcessors onlyAgdaBlocks)
   where
@@ -214,7 +224,7 @@ parseFile onlyAgdaBlocks p file input =
                    }
     go ((ext, (po, ft)) : pos)
       | ext `List.isSuffixOf` path =
-          (, ft) <$> parseLiterateFile po p file input
+          (, ft) <$> parseLiterateFile ft po p file input
       | otherwise = go pos
 
 ------------------------------------------------------------------------

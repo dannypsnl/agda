@@ -43,6 +43,7 @@ data HtmlFlags = HtmlFlags
   , htmlFlagHighlight            :: HtmlHighlight
   , htmlFlagHighlightOccurrences :: Bool
   , htmlFlagCssFile              :: Maybe FilePath
+  , htmlFlagTrIncludePrefix      :: FilePath
   } deriving (Eq, Generic)
 
 instance NFData HtmlFlags
@@ -91,6 +92,7 @@ initialHtmlFlags = HtmlFlags
   -- performance problems
   , htmlFlagHighlightOccurrences = False
   , htmlFlagCssFile              = Nothing
+  , htmlFlagTrIncludePrefix      = ""
   }
 
 htmlOptsOfFlags :: HtmlFlags -> HtmlOptions
@@ -99,6 +101,7 @@ htmlOptsOfFlags flags = HtmlOptions
   , htmlOptHighlight = htmlFlagHighlight flags
   , htmlOptHighlightOccurrences = htmlFlagHighlightOccurrences flags
   , htmlOptCssFile = htmlFlagCssFile flags
+  , htmlOptTrIncludePrefix = htmlFlagTrIncludePrefix flags
   }
 
 -- | The default output directory for HTML.
@@ -122,6 +125,11 @@ htmlFlags =
                     ("whether to highlight only the code parts (code) or " ++
                      "the file as a whole (all) or " ++
                      "decide by source file type (auto)")
+    , Option []     ["tr-include-prefix"] (ReqArg trIncludePrefixFlag "PREFIX")
+                    ("for .lagda.scrbl: path prefix used inside the generated " ++
+                     "@include{...} for each code slice, when the woven .scrbl " ++
+                     "is moved to a different directory than the slices " ++
+                     "(default: none)")
     ]
 
 htmlFlag :: Flag HtmlFlags
@@ -135,6 +143,9 @@ cssFlag f o = return $ o { htmlFlagCssFile = Just f }
 
 highlightOccurrencesFlag :: Flag HtmlFlags
 highlightOccurrencesFlag o = return $ o { htmlFlagHighlightOccurrences = True }
+
+trIncludePrefixFlag :: FilePath -> Flag HtmlFlags
+trIncludePrefixFlag p o = return $ o { htmlFlagTrIncludePrefix = p }
 
 parseHtmlHighlightFlag :: MonadError String m => String -> m HtmlHighlight
 parseHtmlHighlightFlag "code" = return HighlightCode

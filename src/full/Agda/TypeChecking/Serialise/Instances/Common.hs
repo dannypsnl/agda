@@ -49,6 +49,7 @@ instance EmbPrj FileType where
   icod_ OrgFileType   = pure 4
   icod_ TypstFileType = pure 5
   icod_ TreeFileType  = pure 6
+  icod_ ScrblFileType = pure 7
 
   value = \case
     0 -> pure AgdaFileType
@@ -58,6 +59,7 @@ instance EmbPrj FileType where
     4 -> pure OrgFileType
     5 -> pure TypstFileType
     6 -> pure TreeFileType
+    7 -> pure ScrblFileType
     _ -> malformed
 
 instance EmbPrj Cubical where

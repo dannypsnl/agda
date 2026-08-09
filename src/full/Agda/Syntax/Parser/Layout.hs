@@ -110,6 +110,7 @@ module Agda.Syntax.Parser.Layout
 
 import Control.Monad        ( when )
 import Control.Monad.State  ( gets, modify )
+import qualified Data.Map.Strict as Map
 
 import Agda.Syntax.Parser.Lexer
 import Agda.Syntax.Parser.Alex
@@ -189,7 +190,7 @@ newLayoutBlock :: LexAction Token
 newLayoutBlock = LexAction $ \ inp _ _ -> do
     let p = lexPos inp
         i = posToInterval (lexSrcFile inp) p p
-        offset = posCol p
+    offset   <- biasedCol p
     status   <- popPendingLayout
     kw       <- gets parseLayKw
     prevOffs <- confirmedLayoutColumn <$> getContext
@@ -219,10 +220,23 @@ newLayoutBlock = LexAction $ \ inp _ _ -> do
 -- | Compute the relative position of a location to the
 --   current layout context.
 getOffside :: Position' a -> Parser Ordering
-getOffside loc =
+getOffside loc = do
+    col <- biasedCol loc
     getContext <&> \case
-        Layout _ _ n : _ -> compare (posCol loc) n
+        Layout _ _ n : _ -> compare col n
         _                -> GT
+
+-- | 'posCol', minus this line's layout-column bias (see
+--   'parseColumnBias' and 'Agda.Syntax.Parser.Literate.columnBias').
+--   Only the off-side rule reads this; every other consumer of position
+--   (error messages, @--html@) keeps using the real physical column.
+biasedCol :: Position' a -> Parser Column
+biasedCol p = do
+    bias <- gets $ Map.findWithDefault 0 (posLine p) . parseColumnBias
+    -- Never subtract past column 1: a line indented less than its block's
+    -- marker (so nothing left to remove) simply keeps its own column,
+    -- mirroring the clamping tangle-lagda's mirror step did.
+    return $ if bias >= posCol p then 1 else posCol p - bias
 
 -- | At a new line, we confirm either existing tentative layout
 --   columns, or, if the last token was a layout keyword, the expected

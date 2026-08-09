@@ -11,6 +11,7 @@ module Agda.Syntax.Parser.Literate
   , literateOrg
   , illiterate
   , atomizeLayers
+  , columnBias
   , Processor
   , Layers
   , Layer(..)
@@ -23,6 +24,8 @@ module Agda.Syntax.Parser.Literate
 import Control.Monad ((<=<))
 import Data.Char (isSpace)
 import Data.List (isPrefixOf)
+import Data.Word (Word32)
+import qualified Data.Map.Strict as Map
 import Text.Regex.TDFA
   ( Regex, getAllTextSubmatches, match, matchM
   , makeRegexOpts, blankCompOpt, blankExecOpt, newSyntax, caseSensitive
@@ -104,6 +107,7 @@ literateProcessors onlyAgdaBlocks =
     , (".md",  (literateMd onlyAgdaBlocks,  MdFileType ))
     , (".org", (literateOrg, OrgFileType))
     , (".tree", (literateTree, TreeFileType))
+    , (".scrbl", (literateScrbl, ScrblFileType))
     -- For now, treat typst as markdown because they use the same
     -- syntax for code blocks.
     , (".typ", (literateMd onlyAgdaBlocks,  TypstFileType))
@@ -345,3 +349,54 @@ literateTree pos s = mkLayers pos (tree s)
       Nothing -> (Code, line) : code rest
 
   tree_end = rex "([[:blank:]]*)(\\})(.*)"
+
+-- | Preprocessor for literate Agda cards for tr-notes (<https://git.sr.ht/~dannypsnl/tr>).
+--   Code lives between @\@agda|{@ and @}|@, each marker required to stand
+--   alone on its own line (blank-trimmed), matching the convention already
+--   established by the tangle-lagda tool this backend replaces.
+
+literateScrbl :: Processor
+literateScrbl pos s = mkLayers pos (scrbl s)
+  where
+  scrbl :: String -> [(LayerRole, String)]
+  scrbl = caseLine [] $ \ line rest ->
+    if scrbl_begin `match` line
+    then (Markup, line) : code rest
+    else (Comment, line) : scrbl rest
+
+  scrbl_begin = rex "[[:blank:]]*@agda\\|\\{[[:blank:]]*(\n)?"
+
+  code :: String -> [(LayerRole, String)]
+  code = caseLine [] $ \ line rest ->
+    if scrbl_end `match` line
+    then (Markup, line) : scrbl rest
+    else (Code, line) : code rest
+
+  scrbl_end = rex "[[:blank:]]*\\}\\|[[:blank:]]*(\n)?"
+
+-- | Per physical line covered by a 'Code' layer, the column the layout
+--   (off-side rule) algorithm should treat as column 1: the indentation of
+--   the 'Markup' layer that opened the block. This lets code nested inside
+--   indented markup (e.g. tr-notes' @\@agda|{\@ inside a @\@tr\/card{ }\@)
+--   lay out as if flush left, while every other consumer of position
+--   (error messages, @--html@) keeps using the real physical column — see
+--   'Agda.Syntax.Parser.Layout'. This is a pure post-process over 'Layers',
+--   so it never touches 'layerContent' and cannot break the invariant that
+--   layer contents concatenate back to the original source.
+--
+--   Only meaningful for tr-notes' scrbl cards, where a single file mixes
+--   blocks at different physical indentation; callers should not apply it
+--   to other literate formats, where a block's own indentation is already
+--   assumed consistent file-wide.
+columnBias :: Layers -> Map.Map Word32 Word32
+columnBias = go 0
+  where
+  go :: Word32 -> Layers -> Map.Map Word32 Word32
+  go _    []       = Map.empty
+  go bias (l : ls) = case layerRole l of
+    Markup  -> go (leadingWs (layerContent l)) ls
+    Code    -> Map.insert (posLine (iStart (interval l))) bias (go bias ls)
+    Comment -> go bias ls
+
+  leadingWs :: String -> Word32
+  leadingWs = fromIntegral . length . takeWhile (\ c -> c == ' ' || c == '\t')

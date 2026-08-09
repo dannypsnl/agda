@@ -48,6 +48,7 @@ import Control.Monad
 import Data.Maybe ( listToMaybe, fromMaybe )
 import Data.Word  ( Word32 )
 import Data.List  ( uncons )
+import qualified Data.Map.Strict as Map
 
 import GHC.Exts (oneShot)
 
@@ -134,6 +135,12 @@ data ParseState = PState
     , parseLayout     :: !LayoutContext       -- ^ the stack of layout blocks
     , parseLayStatus  :: !LayoutStatus        -- ^ the status of the coming layout block
     , parseLayKw      :: !Keyword             -- ^ the keyword for the coming layout block
+    , parseColumnBias :: !(Map.Map Column Column)
+                                              -- ^ per-line layout-column bias, subtracted from
+                                              --   'posCol' only for off-side-rule decisions (see
+                                              --   'Agda.Syntax.Parser.Layout' and
+                                              --   'Agda.Syntax.Parser.Literate.columnBias').
+                                              --   Every other use of position is unaffected.
     , parseLexState   :: ![LexState]          -- ^ the state of the lexer
                                               --   (states can be nested so we need a stack)
     , parseFlags      :: !ParseFlags          -- ^ parametrization of the parser
@@ -413,8 +420,8 @@ instance HasRange ParseWarning where
     Running the parser
  --------------------------------------------------------------------------}
 
-initStatePos :: Position -> ParseFlags -> String -> [LexState] -> ParseState
-initStatePos pos flags inp st =
+initStatePos :: Map.Map Column Column -> Position -> ParseFlags -> String -> [LexState] -> ParseState
+initStatePos bias pos flags inp st =
         PState  { parseSrcFile      = srcFile pos
                 , parsePos          = pos'
                 , parseLastPos      = pos'
@@ -427,6 +434,7 @@ initStatePos pos flags inp st =
                 , parseLayKw        = KwMutual  -- Layout keyword for the top-level layout.
                                                 -- Does not mean that the top-level block is a mutual block.
                                                 -- Just for better errors on stray @constructor@ decls.
+                , parseColumnBias   = bias
                 , parseFlags        = flags
                 , parseWarnings     = []
                 , parseAttributes   = []
@@ -439,8 +447,8 @@ initStatePos pos flags inp st =
 --   is the input string, the file path is only there because it's part
 --   of a position.
 initState ::
-  Maybe RangeFile -> ParseFlags -> String -> [LexState] -> ParseState
-initState file = initStatePos (startPos file)
+  Map.Map Column Column -> Maybe RangeFile -> ParseFlags -> String -> [LexState] -> ParseState
+initState bias file = initStatePos bias (startPos file)
 
 -- | The default flags.
 defaultParseFlags :: ParseFlags
@@ -450,12 +458,12 @@ defaultParseFlags = ParseFlags { parseKeepComments = False }
 --   more specialised functions that supply the 'ParseFlags' and the
 --   'LexState'.
 parse :: ParseFlags -> [LexState] -> Parser a -> String -> ParseResult a
-parse flags st p input = parseFromSrc flags st p Strict.Nothing input
+parse flags st p input = parseFromSrc Map.empty flags st p Strict.Nothing input
 
 -- | The even more general way of parsing a string.
 parsePosString :: Position -> ParseFlags -> [LexState] -> Parser a -> String ->
                   ParseResult a
-parsePosString pos flags st p input = unP p (initStatePos pos flags input st)
+parsePosString pos flags st p input = unP p (initStatePos Map.empty pos flags input st)
 
 -- | Calls 'parsePosString' with 'Position' extracted from the Range.
 parseRangeString :: Range -> ParseFlags -> [LexState] -> Parser a -> String ->
@@ -464,9 +472,9 @@ parseRangeString = parsePosString . fromMaybe (startPos Nothing) . rStart
 
 -- | Parses a string as if it were the contents of the given file
 --   Useful for integrating preprocessors.
-parseFromSrc :: ParseFlags -> [LexState] -> Parser a -> SrcFile -> String
+parseFromSrc :: Map.Map Column Column -> ParseFlags -> [LexState] -> Parser a -> SrcFile -> String
               -> ParseResult a
-parseFromSrc flags st p src input = unP p (initState (Strict.toLazy src) flags input st)
+parseFromSrc bias flags st p src input = unP p (initState bias (Strict.toLazy src) flags input st)
 
 
 {--------------------------------------------------------------------------

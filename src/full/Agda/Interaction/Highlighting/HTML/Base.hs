@@ -115,6 +115,7 @@ highlightOnlyCode HighlightAuto RstFileType   = True
 highlightOnlyCode HighlightAuto OrgFileType   = True
 highlightOnlyCode HighlightAuto TypstFileType = True
 highlightOnlyCode HighlightAuto TreeFileType  = True
+highlightOnlyCode HighlightAuto ScrblFileType = True
 highlightOnlyCode HighlightAuto TexFileType   = False
 
 -- | Determine the generated file extension
@@ -130,6 +131,7 @@ highlightedFileExt hh ft
       OrgFileType   -> "org"
       TypstFileType -> "typ"
       TreeFileType  -> "tree"
+      ScrblFileType -> "scrbl"
 
 -- | Options for HTML generation
 
@@ -138,6 +140,11 @@ data HtmlOptions = HtmlOptions
   , htmlOptHighlight            :: HtmlHighlight
   , htmlOptHighlightOccurrences :: Bool
   , htmlOptCssFile              :: Maybe FilePath
+  , htmlOptTrIncludePrefix      :: FilePath
+  -- ^ Prefix prepended to the slice file name inside the
+  --   @\@disable-prefix{\@include{...}}@ tr card generates for each code
+  --   block, for when the woven @.scrbl@ ends up in a different directory
+  --   than the slices (both of which are written to 'htmlOptDir').
   } deriving Eq
 
 -- | Internal type bundling the information related to a module source file
@@ -190,6 +197,8 @@ renderSourceFile opts = renderSourcePage
       pageContents = code onlyCode fileType tokens
 
 defaultPageGen :: (MonadIO m, MonadLogHtml m) => HtmlOptions -> HtmlInputSourceFile -> m ()
+defaultPageGen opts srcFile@(HtmlInputSourceFile _ ScrblFileType _ _) =
+  genTrPages opts srcFile
 defaultPageGen opts srcFile@(HtmlInputSourceFile moduleName ft _ _) = do
   logHtml $ render $ "Generating HTML for"  <+> pretty moduleName <+> ((parens (pretty target)) <> ".")
   writeRenderedHtml html target
@@ -197,6 +206,49 @@ defaultPageGen opts srcFile@(HtmlInputSourceFile moduleName ft _ _) = do
     ext = highlightedFileExt (htmlOptHighlight opts) ft
     target = (htmlOptDir opts) </> modToFile moduleName ext
     html = renderSourceFile opts srcFile
+
+-- | Generate the woven @.scrbl@ document for a tr-notes literate Agda card
+--   (@.lagda.scrbl@), plus one highlighted HTML slice per @\@agda|{ ... }|@
+--   block. This replaces the external tangle-lagda tool: 'illiterate'
+--   already does what tangle-lagda's @mirror@ did, and this does what its
+--   @weave@ did, directly off the token stream instead of re-deriving line
+--   alignment from a second @agda --html@ run over the mirror.
+--
+--   Prose outside a block is kept byte-for-byte (via 'preEscapedToHtml',
+--   same as the Markdown/Forester backends). Each code block is written to
+--   its own slice file rather than inlined, because tr's
+--   @\@include{...}@ splices a file's raw text without parsing it as
+--   Scribble, sidestepping any need to escape stray \@\/{\/} characters
+--   that may occur in generated ids or hrefs.
+genTrPages :: (MonadIO m, MonadLogHtml m) => HtmlOptions -> HtmlInputSourceFile -> m ()
+genTrPages opts (HtmlInputSourceFile moduleName _ sourceCode hinfo) = do
+  logHtml $ render $ "Generating Tr literate output for" <+> pretty moduleName <+> ((parens (pretty target)) <> ".")
+  forM_ slices $ \ (html, path) -> writeRenderedHtml html path
+  writeRenderedHtml woven target
+  where
+    dir    = htmlOptDir opts
+    target = dir </> modToFile moduleName "scrbl"
+    prefix = htmlOptTrIncludePrefix opts
+
+    chunks = splitByMarkup $ tokenStream sourceCode hinfo
+
+    (woven, slices, _) = foldl' step (mempty, [], 0 :: Int) chunks
+
+    step (acc, fs, n) chunk
+      | containsCode chunk =
+          ( acc <> include
+          , (sliceHtml, dir </> sliceName) : fs
+          , n + 1
+          )
+      | otherwise = (acc <> prose, fs, n)
+      where
+        sliceName = modToFile moduleName (show n <.> "html")
+        sliceHtml = renderHtml $ Html5.pre ! Attr.class_ "Agda" $
+                      mconcat $ map backgroundOrAgdaToHtml chunk
+        include   = T.pack $ "@disable-prefix{@include{" ++ prefix ++ sliceName ++ "}}\n"
+        prose     = renderHtml $ mconcat $ map backgroundOrAgdaToHtml chunk
+
+    containsCode = any ((/= Just Background) . aspect . trd)
 
 prepareCommonDestinationAssets :: MonadIO m => HtmlOptions -> m ()
 prepareCommonDestinationAssets options = liftIO $ do
@@ -300,6 +352,27 @@ tokenStream contents info =
   where
   infoMap = toMap info
 
+-- Hoisted out of 'code' (rather than kept local to it) so that 'genTrPages'
+-- can reuse the same per-token rendering when slicing chunks into files.
+
+trd :: TokenInfo -> Aspects
+trd (_, _, a) = a
+
+splitByMarkup :: [TokenInfo] -> [[TokenInfo]]
+splitByMarkup = splitWhen $ (== Just Markup) . aspect . trd
+
+mkHtml :: TokenInfo -> Html
+mkHtml (pos, s, mi) =
+  -- Andreas, 2017-06-16, issue #2605:
+  -- Do not create anchors for whitespace.
+  applyUnless (mi == mempty) (annotateToken pos mi) $ toHtml $ List1.toList s
+
+backgroundOrAgdaToHtml :: TokenInfo -> Html
+backgroundOrAgdaToHtml token@(_, s, mi) = case aspect mi of
+  Just Background -> preEscapedToHtml $ List1.toList s
+  Just Markup     -> __IMPOSSIBLE__
+  _               -> mkHtml token
+
 -- | Constructs the HTML displaying the code.
 
 code :: Bool     -- ^ Whether to generate non-code contents as-is
@@ -316,28 +389,15 @@ code onlyCode fileType = mconcat . if onlyCode
          AgdaFileType  -> map mkHtml
          OrgFileType   -> map mkOrg . splitByMarkup
          TreeFileType  -> map mkMd . splitByMarkup
+         -- Unreachable: 'defaultPageGen' routes ScrblFileType to
+         -- 'genTrPages' instead of 'renderSourceFile'/'code'. Kept so this
+         -- case-of stays exhaustive.
+         ScrblFileType -> map mkMd . splitByMarkup
          -- Two useless cases, probably will never used by anyone
          TexFileType   -> map mkMd . splitByMarkup
          TypstFileType -> map mkMd . splitByMarkup
   else map mkHtml
   where
-  trd (_, _, a) = a
-
-  splitByMarkup :: [TokenInfo] -> [[TokenInfo]]
-  splitByMarkup = splitWhen $ (== Just Markup) . aspect . trd
-
-  mkHtml :: TokenInfo -> Html
-  mkHtml (pos, s, mi) =
-    -- Andreas, 2017-06-16, issue #2605:
-    -- Do not create anchors for whitespace.
-    applyUnless (mi == mempty) (annotate pos mi) $ toHtml $ List1.toList s
-
-  backgroundOrAgdaToHtml :: TokenInfo -> Html
-  backgroundOrAgdaToHtml token@(_, s, mi) = case aspect mi of
-    Just Background -> preEscapedToHtml $ List1.toList s
-    Just Markup     -> __IMPOSSIBLE__
-    _               -> mkHtml token
-
   -- Proposed in #3373, implemented in #3384
   mkRst :: [TokenInfo] -> Html
   mkRst = mconcat . (toHtml rstDelimiter :) . map backgroundOrAgdaToHtml
@@ -363,74 +423,74 @@ code onlyCode fileType = mconcat . if onlyCode
       formatCode = startDelimiter : foldr (\x -> (backgroundOrAgdaToHtml x :)) [endDelimiter] tokens
       formatNonCode = map backgroundOrAgdaToHtml tokens
 
-  -- Put anchors that enable referencing that token.
-  -- We put a fail safe numeric anchor (file position) for internal references
-  -- (issue #2756), as well as a heuristic name anchor for external references
-  -- (issue #2604).
-  annotate :: Int -> Aspects -> Html -> Html
-  annotate pos mi =
-    applyWhen hereAnchor (anchorage nameAttributes mempty <>) . anchorage posAttributes
+-- Put anchors that enable referencing that token.
+-- We put a fail safe numeric anchor (file position) for internal references
+-- (issue #2756), as well as a heuristic name anchor for external references
+-- (issue #2604).
+annotateToken :: Int -> Aspects -> Html -> Html
+annotateToken pos mi =
+  applyWhen hereAnchor (anchorage nameAttributes mempty <>) . anchorage posAttributes
+  where
+  -- Warp an anchor (<A> tag) with the given attributes around some HTML.
+  anchorage :: [Attribute] -> Html -> Html
+  anchorage attrs html = Html5.a html !! attrs
+
+  -- File position anchor (unique, reliable).
+  posAttributes :: [Attribute]
+  posAttributes = concat
+    [ [Attr.id $ stringValue $ show pos ]
+    , toList $ link <$> definitionSite mi
+    , Attr.class_ (stringValue $ unwords classes) <$ guard (not $ null classes)
+    ]
+
+  -- Named anchor (not reliable, but useful in the general case for outside refs).
+  nameAttributes :: [Attribute]
+  nameAttributes = [ Attr.id $ stringValue $ fromMaybe __IMPOSSIBLE__ $ mDefSiteAnchor ]
+
+  classes = concat
+    [ concatMap noteClasses (note mi)
+    , otherAspectClasses (toList $ otherAspects mi)
+    , concatMap aspectClasses (aspect mi)
+    ]
+
+  aspectClasses (Name mKind op) = kindClass ++ opClass
     where
-    -- Warp an anchor (<A> tag) with the given attributes around some HTML.
-    anchorage :: [Attribute] -> Html -> Html
-    anchorage attrs html = Html5.a html !! attrs
+    kindClass = toList $ fmap showKind mKind
 
-    -- File position anchor (unique, reliable).
-    posAttributes :: [Attribute]
-    posAttributes = concat
-      [ [Attr.id $ stringValue $ show pos ]
-      , toList $ link <$> definitionSite mi
-      , Attr.class_ (stringValue $ unwords classes) <$ guard (not $ null classes)
-      ]
+    showKind (Constructor Inductive)   = "InductiveConstructor"
+    showKind (Constructor CoInductive) = "CoinductiveConstructor"
+    showKind k                         = show k
 
-    -- Named anchor (not reliable, but useful in the general case for outside refs).
-    nameAttributes :: [Attribute]
-    nameAttributes = [ Attr.id $ stringValue $ fromMaybe __IMPOSSIBLE__ $ mDefSiteAnchor ]
-
-    classes = concat
-      [ concatMap noteClasses (note mi)
-      , otherAspectClasses (toList $ otherAspects mi)
-      , concatMap aspectClasses (aspect mi)
-      ]
-
-    aspectClasses (Name mKind op) = kindClass ++ opClass
-      where
-      kindClass = toList $ fmap showKind mKind
-
-      showKind (Constructor Inductive)   = "InductiveConstructor"
-      showKind (Constructor CoInductive) = "CoinductiveConstructor"
-      showKind k                         = show k
-
-      opClass = ["Operator" | op]
-    aspectClasses a = [show a]
+    opClass = ["Operator" | op]
+  aspectClasses a = [show a]
 
 
-    otherAspectClasses = map show
+  otherAspectClasses = map show
 
-    -- Notes are not included.
-    noteClasses _s = []
+  -- Notes are not included.
+  noteClasses _s = []
 
-    -- Should we output a named anchor?
-    -- Only if we are at the definition site now (@here@)
-    -- and such a pretty named anchor exists (see 'defSiteAnchor').
-    hereAnchor      :: Bool
-    hereAnchor      = here && isJust mDefSiteAnchor
+  -- Should we output a named anchor?
+  -- Only if we are at the definition site now (@here@)
+  -- and such a pretty named anchor exists (see 'defSiteAnchor').
+  hereAnchor      :: Bool
+  hereAnchor      = here && isJust mDefSiteAnchor
 
-    mDefinitionSite :: Maybe DefinitionSite
-    mDefinitionSite = definitionSite mi
+  mDefinitionSite :: Maybe DefinitionSite
+  mDefinitionSite = definitionSite mi
 
-    -- Are we at the definition site now?
-    here            :: Bool
-    here            = maybe False defSiteHere mDefinitionSite
+  -- Are we at the definition site now?
+  here            :: Bool
+  here            = maybe False defSiteHere mDefinitionSite
 
-    mDefSiteAnchor  :: Maybe String
-    mDefSiteAnchor  = maybe __IMPOSSIBLE__ defSiteAnchor mDefinitionSite
+  mDefSiteAnchor  :: Maybe String
+  mDefSiteAnchor  = maybe __IMPOSSIBLE__ defSiteAnchor mDefinitionSite
 
-    link (DefinitionSite m defPos _here _aName) = Attr.href $ stringValue $
-      -- If the definition site points to the top of a file,
-      -- we drop the anchor part and just link to the file.
-      applyUnless (defPos <= 1)
-        (++ "#" ++
-         Network.URI.Encode.encode (show defPos))
-         -- Network.URI.Encode.encode (fromMaybe (show defPos) aName)) -- Named links disabled
-        (Network.URI.Encode.encode $ modToFile m "html")
+  link (DefinitionSite m defPos _here _aName) = Attr.href $ stringValue $
+    -- If the definition site points to the top of a file,
+    -- we drop the anchor part and just link to the file.
+    applyUnless (defPos <= 1)
+      (++ "#" ++
+       Network.URI.Encode.encode (show defPos))
+       -- Network.URI.Encode.encode (fromMaybe (show defPos) aName)) -- Named links disabled
+      (Network.URI.Encode.encode $ modToFile m "html")
